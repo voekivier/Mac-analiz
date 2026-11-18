@@ -1,243 +1,231 @@
 import io
-import re
-import time
-from datetime import date, datetime
+import unicodedata
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
-import requests as std_requests
+import requests
 import streamlit as st
-from bs4 import BeautifulSoup
-
-try:
-    from curl_cffi import requests as cffi_requests
-except ImportError:
-    cffi_requests = None
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Fikstür & Rakip Analizi", page_icon="⚽", layout="centered")
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": "https://www.transfermarkt.com.tr/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
 }
 
-
-def http_get(url: str, params: dict | None = None):
-    """Chrome TLS kimliği ile güvenli HTTP isteği atar."""
-    if cffi_requests is not None:
-        return cffi_requests.get(
-            url,
-            params=params,
-            headers=HEADERS,
-            impersonate="chrome",
-            timeout=20,
-        )
-    return std_requests.get(url, params=params, headers=HEADERS, timeout=20)
+TR_TZ = timezone(timedelta(hours=3))
 
 
-# --- YARDIMCI FONKSİYONLAR ---
-
-
-def parse_tm_date(text: str) -> date | None:
-    """Transfermarkt tarih formatlarını (21.11.2026 veya 21.11.26) date objesine çevirir."""
-    match = re.search(r"(\d{2}\.\d{2}\.\d{4}|\d{2}\.\d{2}\.\d{2})", text)
-    if not match:
-        return None
-    raw = match.group(1)
-    fmt = "%d.%m.%Y" if len(raw) == 10 else "%d.%m.%y"
-    try:
-        return datetime.strptime(raw, fmt).date()
-    except ValueError:
-        return None
+def normalize_tr(text: str) -> str:
+    """Türkçe karakterleri sadeleştirerek arama eşleşmesini kolaylaştırır."""
+    replacements = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+    text = text.translate(replacements).lower().strip()
+    return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
 
 
 def get_season_id(match_date: date) -> int:
-    """Maç tarihine göre Transfermarkt sezon yılını (örn. 2026/27 için 2026) döndürür."""
+    """Maç tarihine göre sezon başlangıç yılını (örn. 2026/27 için 2026) döndürür."""
     return match_date.year if match_date.month >= 7 else match_date.year - 1
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_turkish_league_teams() -> list[dict]:
+    """Süper Lig ve TFF 1. Lig takımlarını önbelleğe alır."""
+    teams = []
+    seen = set()
+    for league_code in ("tur.1", "tur.2"):
+        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_code}/teams"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            for sport in data.get("sports", []):
+                for league in sport.get("leagues", []):
+                    for item in league.get("teams", []):
+                        t = item.get("team", {})
+                        tid = str(t.get("id", ""))
+                        name = t.get("displayName") or t.get("name", "")
+                        if tid and name and tid not in seen:
+                            seen.add(tid)
+                            teams.append({"id": tid, "name": name, "league": league_code})
+        except Exception:
+            continue
+    return teams
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def search_clubs(query: str) -> tuple[list[dict], str | None]:
-    """Transfermarkt üzerinde kulüp arar veya doğrudan yapıştırılan URL'yi çözer."""
+    """ESPN üzerinde dünya genelinde ve Türkiye liglerinde takım arar."""
     q = query.strip()
     if not q:
         return [], "Takım adı boş olamaz."
 
-    # Kullanıcı doğrudan Transfermarkt takım linki yapıştırdıysa anında çöz
-    url_match = re.search(r"/([^/]+)/(?:startseite|spielplan|kader|profil)/verein/(\d+)", q)
-    if url_match:
-        slug, club_id = url_match.group(1), url_match.group(2)
-        return [{"id": club_id, "slug": slug, "name": slug.replace("-", " ").title()}], None
+    norm_q = normalize_tr(q)
+    results = []
+    seen_ids = set()
 
+    # 1. Önce Türkiye ligleri önbelleğinden hızlı eşleştir
+    for t in get_turkish_league_teams():
+        if norm_q in normalize_tr(t["name"]):
+            seen_ids.add(t["id"])
+            results.append(t)
+
+    # 2. ESPN genel futbol araması (Avrupa ve dünya takımları dahil)
     try:
-        url = "https://www.transfermarkt.com.tr/schnellsuche/ergebnis/schnellsuche"
-        resp = http_get(url, params={"query": q})
-        if resp.status_code != 200:
-            return [], f"Transfermarkt erişim kodu: {resp.status_code}"
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        clubs = []
-        seen_ids = set()
-
-        for a in soup.find_all("a", href=re.compile(r"/([^/]+)/(?:startseite|profil|spielplan)/verein/(\d+)")):
-            m = re.search(r"/([^/]+)/(?:startseite|profil|spielplan)/verein/(\d+)", a["href"])
-            if not m:
-                continue
-            slug, club_id = m.group(1), m.group(2)
-            name = (a.get("title") or a.get_text(strip=True)).strip()
-            if not name or club_id in seen_ids:
-                continue
-            seen_ids.add(club_id)
-            clubs.append({"id": club_id, "slug": slug, "name": name})
-
-        if not clubs:
-            return [], "Arama sonucunda kulüp eşleşmedi."
-        return clubs, None
+        url = "https://site.web.api.espn.com/apis/common/v3/search"
+        resp = requests.get(
+            url,
+            params={"query": q, "limit": 20, "type": "team"},
+            headers=HEADERS,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data.get("items", []):
+                sport = item.get("sport", "")
+                uid = item.get("uid", "")
+                if sport == "soccer" or "s:600" in uid:
+                    tid = str(item.get("id", ""))
+                    name = item.get("displayName") or item.get("name", "")
+                    league = item.get("league", "all")
+                    if tid and name and tid not in seen_ids:
+                        seen_ids.add(tid)
+                        results.append({"id": tid, "name": name, "league": league})
     except Exception as e:
-        return [], f"Bağlantı hatası: {e}"
+        if not results:
+            return [], f"Bağlantı hatası: {e}"
+
+    if not results:
+        return [], "Takım bulunamadı. Yazımı kontrol edip tekrar deneyin."
+    return results, None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_season_schedule(club_id: str, club_slug: str, season_id: int) -> list[dict]:
-    """Bir takımın ilgili sezondaki tüm kulvarlardaki fikstürünü kronolojik çeker."""
-    time.sleep(0.4)
-    url = f"https://www.transfermarkt.com.tr/{club_slug}/spielplandatum/verein/{club_id}/saison_id/{season_id}"
-    resp = http_get(url)
-    if resp.status_code != 200:
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    table = soup.select_one("div.responsive-table table")
-    if not table:
-        return []
-
-    matches = []
-    current_comp = ""
-
-    for row in table.find_all("tr"):
-        header_cell = row.find("td", attrs={"colspan": True})
-        if header_cell and not row.find("a", href=re.compile(r"/verein/\d+")):
-            comp_link = header_cell.find("a")
-            current_comp = (
-                comp_link.get("title") or comp_link.get_text(strip=True)
-                if comp_link
-                else header_cell.get_text(strip=True)
-            )
+def parse_espn_events(events: list[dict], club_id: str) -> list[dict]:
+    """ESPN etkinlik listesini standart maç formatına dönüştürür."""
+    parsed = []
+    for ev in events:
+        raw_date = ev.get("date", "")
+        if not raw_date:
+            continue
+        try:
+            dt_utc = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            m_date = dt_utc.astimezone(TR_TZ).date()
+        except ValueError:
             continue
 
-        row_text = row.get_text(" ", strip=True)
-        m_date = parse_tm_date(row_text)
-        if not m_date:
+        comps = ev.get("competitions", [])
+        if not comps:
+            continue
+        comp = comps[0]
+        competitors = comp.get("competitors", [])
+        if len(competitors) < 2:
             continue
 
-        opp_id, opp_name = None, None
-        for a in row.find_all("a", href=re.compile(r"/([^/]+)/(?:spielplan|startseite|profil)/verein/(\d+)")):
-            m = re.search(r"/([^/]+)/(?:spielplan|startseite|profil)/verein/(\d+)", a["href"])
-            if m and m.group(2) != str(club_id):
-                opp_id = m.group(2)
-                opp_name = (a.get("title") or a.get_text(strip=True)).strip()
-                if opp_name:
-                    break
+        my_side = None
+        opp_side = None
+        for c in competitors:
+            c_team = c.get("team", {})
+            if str(c_team.get("id", "")) == str(club_id):
+                my_side = c
+            else:
+                opp_side = c
 
+        if not my_side or not opp_side:
+            continue
+
+        opp_team = opp_side.get("team", {})
+        opp_id = str(opp_team.get("id", ""))
+        opp_name = opp_team.get("displayName") or opp_team.get("shortDisplayName", "")
         if not opp_id or not opp_name:
             continue
 
-        venue = ""
-        for td in row.find_all("td"):
-            txt = td.get_text(strip=True)
-            if txt in ("E", "D", "H", "A", "T"):
-                venue = "Ev" if txt in ("E", "H") else ("Dep" if txt in ("D", "A") else "Tarafsız")
-                break
+        home_away = my_side.get("homeAway", "")
+        venue = "Ev" if home_away == "home" else ("Dep" if home_away == "away" else "")
 
-        score_match = re.search(r"\b(\d+:\d+)\b", row_text)
-        score = score_match.group(1) if score_match else "-"
+        def extract_score(side: dict) -> str:
+            sc = side.get("score")
+            if isinstance(sc, dict):
+                return str(sc.get("displayValue", ""))
+            return str(sc) if sc is not None else ""
 
-        matches.append(
+        my_sc = extract_score(my_side)
+        opp_sc = extract_score(opp_side)
+        if my_sc != "" and opp_sc != "":
+            score = f"{my_sc}:{opp_sc}" if home_away == "home" else f"{opp_sc}:{my_sc}"
+        else:
+            score = "-:-"
+
+        home_name = my_side.get("team", {}).get("displayName", "") if home_away == "home" else opp_name
+        away_name = opp_name if home_away == "home" else my_side.get("team", {}).get("displayName", "")
+
+        parsed.append(
             {
+                "event_id": str(ev.get("id", f"{m_date}_{opp_id}")),
                 "date": m_date,
                 "opp_id": opp_id,
                 "opp_name": opp_name,
                 "venue": venue,
                 "score": score,
-                "comp": current_comp,
+                "home_name": home_name,
+                "away_name": away_name,
             }
         )
-
-    matches.sort(key=lambda x: x["date"])
-    return matches
+    return parsed
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_h2h_matches(club_a_id: str, club_a_slug: str, club_b_id: str) -> list[dict]:
-    """İki takım arasındaki tüm geçmiş ve planlanmış karşılaşmaları çeker."""
-    time.sleep(0.4)
-    url = f"https://www.transfermarkt.com.tr/{club_a_slug}/bilanzdetail/verein/{club_a_id}/gegner_id/{club_b_id}"
-    resp = http_get(url)
-    if resp.status_code != 200:
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    table = soup.select_one("div.responsive-table table")
-    if not table:
-        return []
-
-    h2h_list = []
-
-    for row in table.find_all("tr"):
-        row_text = row.get_text(" ", strip=True)
-        m_date = parse_tm_date(row_text)
-        if not m_date:
-            continue
-
-        teams_in_row = []
-        seen_row_ids = set()
-        for a in row.find_all("a", href=re.compile(r"/([^/]+)/(?:spielplan|startseite|profil)/verein/(\d+)")):
-            m = re.search(r"/([^/]+)/(?:spielplan|startseite|profil)/verein/(\d+)", a["href"])
-            if m:
-                tid = m.group(2)
-                tname = (a.get("title") or a.get_text(strip=True)).strip()
-                if tname and tid not in seen_row_ids:
-                    seen_row_ids.add(tid)
-                    teams_in_row.append({"id": tid, "name": tname})
-
-        if len(teams_in_row) < 2:
-            continue
-
-        score_match = re.search(r"\b(\d+:\d+)\b", row_text)
-        score = score_match.group(1) if score_match else "-:-"
-
-        h2h_list.append(
-            {
-                "date": m_date,
-                "home_id": teams_in_row[0]["id"],
-                "home_name": teams_in_row[0]["name"],
-                "away_id": teams_in_row[1]["id"],
-                "away_name": teams_in_row[1]["name"],
-                "score": score,
-            }
+def fetch_season_schedule(club_id: str, league_hint: str, season_id: int) -> list[dict]:
+    """Bir takımın ilgili sezondaki tüm kulvar fikstürünü kronolojik olarak çeker."""
+    endpoints = [
+        f"https://site.api.espn.com/apis/site/v2/sports/soccer/all/teams/{club_id}/schedule",
+    ]
+    if league_hint and league_hint != "all":
+        endpoints.append(
+            f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_hint}/teams/{club_id}/schedule"
         )
 
-    h2h_list.sort(key=lambda x: x["date"], reverse=True)
-    return h2h_list
+    merged = {}
+    for url in endpoints:
+        try:
+            resp = requests.get(url, params={"season": season_id}, headers=HEADERS, timeout=15)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            for m in parse_espn_events(data.get("events", []), club_id):
+                key = f"{m['date']}_{m['opp_id']}"
+                if key not in merged:
+                    merged[key] = m
+        except Exception:
+            continue
+
+    matches = list(merged.values())
+    matches.sort(key=lambda x: x["date"])
+    return matches
 
 
 def find_neighbors(schedule: list[dict], target_date: date, opp_id: str):
     """Fikstür listesinde hedef maçı bulur; bir önceki ve bir sonraki maçı döndürür."""
     idx = None
+    # 1. Tam tarih + rakip eşleşmesi
     for i, m in enumerate(schedule):
         if m["opp_id"] == str(opp_id) and m["date"] == target_date:
             idx = i
             break
+    # 2. Hafta sonu gün kayması (Cuma-Pazartesi) için ±5 gün toleranslı rakip eşleşmesi
     if idx is None:
         for i, m in enumerate(schedule):
-            if m["opp_id"] == str(opp_id) and abs((m["date"] - target_date).days) <= 4:
+            if m["opp_id"] == str(opp_id) and abs((m["date"] - target_date).days) <= 5:
                 idx = i
                 break
+    # 3. Sezon içinde aynı rakiple oynanan en yakın tarihli maç
+    if idx is None:
+        candidates = [(abs((m["date"] - target_date).days), i) for i, m in enumerate(schedule) if m["opp_id"] == str(opp_id)]
+        if candidates:
+            candidates.sort()
+            idx = candidates[0][1]
+    # 4. Sadece tarih eşleşmesi
     if idx is None:
         for i, m in enumerate(schedule):
             if m["date"] == target_date:
@@ -263,13 +251,13 @@ def format_opp(match_info: dict | None, show_details: bool) -> str:
 
 # --- ARAYÜZ ---
 st.title("⚽ Maç Öncesi & Sonrası Rakip Analizi")
-st.caption("Takım adını yazın veya doğrudan Transfermarkt takım sayfası linkini yapıştırın.")
+st.caption("Seçilen maç ve geçmiş karşılaşmalar için her iki takımın bir önceki ve bir sonraki rakiplerini listeler.")
 
 col1, col2 = st.columns(2)
 with col1:
-    team_a_query = st.text_input("1. Takım Adı veya Linki", value="Galatasaray")
+    team_a_query = st.text_input("1. Takım Adı", value="Galatasaray")
 with col2:
-    team_b_query = st.text_input("2. Takım Adı veya Linki", value="Samsunspor")
+    team_b_query = st.text_input("2. Takım Adı", value="Samsunspor")
 
 if st.button("Takımları Getir", type="secondary"):
     with st.spinner("Takımlar aranıyor..."):
@@ -297,13 +285,13 @@ if "clubs_a" in st.session_state and "clubs_b" in st.session_state:
             sel_a = st.selectbox(
                 "1. Takımı Onayla",
                 options=clubs_a,
-                format_func=lambda x: f"{x['name']} (ID: {x['id']})",
+                format_func=lambda x: f"{x['name']} ({x['league'].upper()})",
             )
         with c2:
             sel_b = st.selectbox(
                 "2. Takımı Onayla",
                 options=clubs_b,
-                format_func=lambda x: f"{x['name']} (ID: {x['id']})",
+                format_func=lambda x: f"{x['name']} ({x['league'].upper()})",
             )
 
         c3, c4 = st.columns(2)
@@ -317,8 +305,8 @@ if "clubs_a" in st.session_state and "clubs_b" in st.session_state:
         if st.button("Analizi Başlat", type="primary"):
             with st.spinner("Fikstürler ve geçmiş karşılaşmalar taranıyor..."):
                 target_season = get_season_id(target_date)
-                sched_a_curr = fetch_season_schedule(sel_a["id"], sel_a["slug"], target_season)
-                sched_b_curr = fetch_season_schedule(sel_b["id"], sel_b["slug"], target_season)
+                sched_a_curr = fetch_season_schedule(sel_a["id"], sel_a["league"], target_season)
+                sched_b_curr = fetch_season_schedule(sel_b["id"], sel_b["league"], target_season)
 
                 prev_a, next_a = find_neighbors(sched_a_curr, target_date, sel_b["id"])
                 prev_b, next_b = find_neighbors(sched_b_curr, target_date, sel_a["id"])
@@ -352,20 +340,28 @@ if "clubs_a" in st.session_state and "clubs_b" in st.session_state:
                     }
                 ]
 
-                all_h2h = fetch_h2h_matches(sel_a["id"], sel_a["slug"], sel_b["id"])
-                past_h2h = [m for m in all_h2h if m["date"] < target_date][:h2h_limit]
+                # Son 15 sezonu tarayarak geçmiş karşılaşmaları bul
+                past_h2h = []
+                for s_year in range(target_season, target_season - 16, -1):
+                    s_a = fetch_season_schedule(sel_a["id"], sel_a["league"], s_year)
+                    for m in reversed(s_a):
+                        if m["opp_id"] == str(sel_b["id"]) and m["date"] < target_date:
+                            past_h2h.append((s_year, m))
+                            if len(past_h2h) >= h2h_limit:
+                                break
+                    if len(past_h2h) >= h2h_limit:
+                        break
 
                 if not past_h2h:
-                    lines.append("Bu tarihten önce oynanmış karşılaşma bulunamadı.")
+                    lines.append("Son 15 sezonda bu tarihten önce oynanmış karşılaşma bulunamadı.")
                 else:
-                    for h in past_h2h:
+                    for h_season, h in past_h2h:
                         h_date = h["date"]
-                        h_season = get_season_id(h_date)
                         h_date_str = h_date.strftime("%d.%m.%Y")
                         match_title = f"{h_date_str} | {h['home_name']} {h['score']} {h['away_name']}"
 
-                        s_a = fetch_season_schedule(sel_a["id"], sel_a["slug"], h_season)
-                        s_b = fetch_season_schedule(sel_b["id"], sel_b["slug"], h_season)
+                        s_a = fetch_season_schedule(sel_a["id"], sel_a["league"], h_season)
+                        s_b = fetch_season_schedule(sel_b["id"], sel_b["league"], h_season)
 
                         p_a, n_a = find_neighbors(s_a, h_date, sel_b["id"])
                         p_b, n_b = find_neighbors(s_b, h_date, sel_a["id"])
@@ -407,5 +403,5 @@ if "clubs_a" in st.session_state and "clubs_b" in st.session_state:
                     data=buffer.getvalue(),
                     file_name=f"{sel_a['name']}_{sel_b['name']}_analiz.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-    
+        )
+                
