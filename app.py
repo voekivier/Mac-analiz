@@ -1,543 +1,309 @@
-import io
-import unicodedata
+import io, unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+import pandas as pd, requests, streamlit as st
 
-import requests
-import streamlit as st
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
-
-# --- SAYFA AYARLARI ---
 st.set_page_config(page_title="1/2 & 2/1 Rakip Analizi", page_icon="⚽", layout="centered")
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
-}
-
+HDR = {"User-Agent": "Mozilla/5.0"}
 TR_TZ = timezone(timedelta(hours=3))
-
-
-def normalize_tr(text: str) -> str:
-    replacements = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
-    text = text.translate(replacements).lower().strip()
-    return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
-
-
-def get_season_id(match_date: date) -> int:
-    return match_date.year if match_date.month >= 7 else match_date.year - 1
-
-
-def to_int_or_none(val) -> int | None:
-    if val is None or val == "":
-        return None
-    try:
-        return int(float(val))
-    except (ValueError, TypeError):
-        return None
-
+API = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+norm = lambda s: "".join(c for c in unicodedata.normalize("NFD", s.translate(str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")).lower().strip()) if unicodedata.category(c) != "Mn")
+season_of = lambda d: d.year if d.month >= 7 else d.year - 1
+to_int = lambda v: int(float(v)) if v not in (None, "") and str(v).lstrip("-").replace(".", "", 1).isdigit() else None
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_turkish_league_teams() -> list[dict]:
-    teams = []
-    seen = set()
-    for league_code in ("tur.1", "tur.2"):
-        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_code}/teams"
+def get_tr_teams():
+    teams, seen = [], set()
+    for lg in ("tur.1", "tur.2"):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            for sport in data.get("sports", []):
-                for league in sport.get("leagues", []):
-                    for item in league.get("teams", []):
-                        t = item.get("team", {})
-                        tid = str(t.get("id", ""))
-                        name = t.get("displayName") or t.get("name", "")
-                        if tid and name and tid not in seen:
+            for sp in requests.get(f"{API}/{lg}/teams", headers=HDR, timeout=12).json().get("sports", []):
+                for lo in sp.get("leagues", []):
+                    for it in lo.get("teams", []):
+                        t = it.get("team", {})
+                        tid, nm = str(t.get("id", "")), t.get("displayName") or t.get("name", "")
+                        if tid and nm and tid not in seen:
                             seen.add(tid)
-                            teams.append({"id": tid, "name": name, "league": league_code})
+                            teams.append({"id": tid, "name": nm, "league": lg})
         except Exception:
-            continue
+            pass
     return teams
 
-
 @st.cache_data(ttl=3600, show_spinner=False)
-def search_clubs(query: str) -> tuple[list[dict], str | None]:
-    q = query.strip()
+def search_clubs(q: str):
+    q = q.strip()
     if not q:
-        return [], "Takım adı boş olamaz."
-
-    norm_q = normalize_tr(q)
-    results = []
-    seen_ids = set()
-
-    for t in get_turkish_league_teams():
-        if norm_q in normalize_tr(t["name"]):
-            seen_ids.add(t["id"])
-            results.append(t)
-
+        return [], "Takım adı boş."
+    nq, res, seen = norm(q), [], set()
+    for t in get_tr_teams():
+        if nq in norm(t["name"]):
+            seen.add(t["id"])
+            res.append(t)
     try:
-        url = "https://site.web.api.espn.com/apis/common/v3/search"
-        resp = requests.get(
-            url,
-            params={"query": q, "limit": 20, "type": "team"},
-            headers=HEADERS,
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            for item in data.get("items", []):
-                sport = item.get("sport", "")
-                uid = item.get("uid", "")
-                if sport == "soccer" or "s:600" in uid:
-                    tid = str(item.get("id", ""))
-                    name = item.get("displayName") or item.get("name", "")
-                    league = item.get("league", "all")
-                    if tid and name and tid not in seen_ids:
-                        seen_ids.add(tid)
-                        results.append({"id": tid, "name": name, "league": league})
+        for it in requests.get("https://site.web.api.espn.com/apis/common/v3/search", params={"query": q, "limit": 20, "type": "team"}, headers=HDR, timeout=12).json().get("items", []):
+            if it.get("sport") == "soccer" or "s:600" in it.get("uid", ""):
+                tid, nm = str(it.get("id", "")), it.get("displayName") or it.get("name", "")
+                if tid and nm and tid not in seen:
+                    seen.add(tid)
+                    res.append({"id": tid, "name": nm, "league": it.get("league", "all")})
     except Exception as e:
-        if not results:
+        if not res:
             return [], f"Bağlantı hatası: {e}"
+    return (res, None) if res else ([], "Takım bulunamadı.")
 
-    if not results:
-        return [], "Takım bulunamadı. Yazımı kontrol edip tekrar deneyin."
-    return results, None
-
-
-def extract_ht_from_competitors(competitors: list[dict]) -> tuple[int | None, int | None]:
-    ht_home, ht_away = None, None
-    for c in competitors:
-        ha = c.get("homeAway", "")
-        ls = c.get("linescores", [])
-        if ls and isinstance(ls, list):
-            p1 = to_int_or_none(ls[0].get("value") if isinstance(ls[0], dict) else ls[0])
-            if ha == "home":
-                ht_home = p1
-            elif ha == "away":
-                ht_away = p1
-    return ht_home, ht_away
-
+def ht_comp(cs):
+    h = a = None
+    for c in cs:
+        ls = c.get("linescores") or []
+        if ls:
+            v = to_int(ls[0].get("value") if isinstance(ls[0], dict) else ls[0])
+            if c.get("homeAway") == "home":
+                h = v
+            elif c.get("homeAway") == "away":
+                a = v
+    return h, a
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_halftime_scores(event_id: str, league_hint: str, home_id: str, away_id: str) -> tuple[int | None, int | None]:
-    if not event_id or not event_id.isdigit():
+def fetch_ht(eid: str, lg: str, hid: str, aid: str):
+    if not eid or not eid.isdigit():
         return None, None
-
-    endpoints = []
-    if league_hint and league_hint != "all":
-        endpoints.append(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_hint}/summary")
-    endpoints.append("https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary")
-
-    for url in endpoints:
+    for u in ([f"{API}/{lg}/summary"] if lg and lg != "all" else []) + [f"{API}/all/summary"]:
         try:
-            resp = requests.get(url, params={"event": event_id}, headers=HEADERS, timeout=12)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-
-            header_comps = data.get("header", {}).get("competitions", [])
-            if header_comps:
-                competitors = header_comps[0].get("competitors", [])
-                ht_h, ht_a = extract_ht_from_competitors(competitors)
-                if ht_h is not None and ht_a is not None:
-                    return ht_h, ht_a
-
-                details = header_comps[0].get("details", [])
-                if details:
-                    h_goals, a_goals = 0, 0
-                    found_goal_detail = False
-                    for d in details:
-                        if d.get("scoringPlay"):
-                            found_goal_detail = True
-                            period = d.get("period", {}).get("number", 0)
-                            tid = str(d.get("team", {}).get("id", ""))
-                            if period == 1:
-                                if tid == str(home_id):
-                                    h_goals += 1
-                                elif tid == str(away_id):
-                                    a_goals += 1
-                    if found_goal_detail:
-                        return h_goals, a_goals
-
-            scoring_plays = data.get("scoringPlays", [])
-            if scoring_plays:
-                h_goals, a_goals = 0, 0
-                for sp in scoring_plays:
-                    period = sp.get("period", {}).get("number", 0)
-                    tid = str(sp.get("team", {}).get("id", ""))
-                    if period == 1:
-                        if tid == str(home_id):
-                            h_goals += 1
-                        elif tid == str(away_id):
-                            a_goals += 1
-                return h_goals, a_goals
+            d = requests.get(u, params={"event": eid}, headers=HDR, timeout=10).json()
+            hc = d.get("header", {}).get("competitions", [])
+            if hc:
+                hh, ha = ht_comp(hc[0].get("competitors", []))
+                if hh is not None and ha is not None:
+                    return hh, ha
+                dets = [x for x in hc[0].get("details", []) if x.get("scoringPlay")]
+                if dets:
+                    p1 = [str(x.get("team", {}).get("id", "")) for x in dets if x.get("period", {}).get("number") == 1]
+                    return p1.count(str(hid)), p1.count(str(aid))
+            sps = d.get("scoringPlays", [])
+            if sps:
+                p1 = [str(x.get("team", {}).get("id", "")) for x in sps if x.get("period", {}).get("number") == 1]
+                return p1.count(str(hid)), p1.count(str(aid))
         except Exception:
-            continue
-
+            pass
     return None, None
 
-
-def parse_espn_events(events: list[dict], club_id: str) -> list[dict]:
-    parsed = []
-    for ev in events:
-        raw_date = ev.get("date", "")
-        if not raw_date:
-            continue
+def parse_ev(evs, cid):
+    out = []
+    for ev in evs:
         try:
-            dt_utc = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-            m_date = dt_utc.astimezone(TR_TZ).date()
-        except ValueError:
-            continue
-
-        comps = ev.get("competitions", [])
-        if not comps:
-            continue
-        comp = comps[0]
-        competitors = comp.get("competitors", [])
-        if len(competitors) < 2:
-            continue
-
-        my_side = opp_side = home_side = away_side = None
-        for c in competitors:
-            c_team = c.get("team", {})
-            ha = c.get("homeAway", "")
-            if ha == "home":
-                home_side = c
-            elif ha == "away":
-                away_side = c
-            if str(c_team.get("id", "")) == str(club_id):
-                my_side = c
-            else:
-                opp_side = c
-
-        if not my_side or not opp_side or not home_side or not away_side:
-            continue
-
-        opp_team = opp_side.get("team", {})
-        opp_id = str(opp_team.get("id", ""))
-        opp_name = opp_team.get("displayName") or opp_team.get("shortDisplayName", "")
-        if not opp_id or not opp_name:
-            continue
-
-        home_team = home_side.get("team", {})
-        away_team = away_side.get("team", {})
-        home_id = str(home_team.get("id", ""))
-        away_id = str(away_team.get("id", ""))
-        home_name = home_team.get("displayName") or home_team.get("shortDisplayName", "")
-        away_name = away_team.get("displayName") or away_team.get("shortDisplayName", "")
-
-        my_ha = my_side.get("homeAway", "")
-        venue = "Ev" if my_ha == "home" else ("Dep" if my_ha == "away" else "")
-
-        def extract_score_int(side: dict) -> int | None:
-            sc = side.get("score")
-            if isinstance(sc, dict):
-                return to_int_or_none(sc.get("value") if sc.get("value") is not None else sc.get("displayValue"))
-            return to_int_or_none(sc)
-
-        status_completed = comp.get("status", {}).get("type", {}).get("completed", False)
-        ft_home = extract_score_int(home_side) if status_completed else None
-        ft_away = extract_score_int(away_side) if status_completed else None
-        ht_home, ht_away = extract_ht_from_competitors(competitors) if status_completed else (None, None)
-        league_slug = ev.get("league", {}).get("slug", "") if isinstance(ev.get("league"), dict) else ""
-
-        parsed.append(
-            {
-                "event_id": str(ev.get("id", "")),
-                "league_slug": league_slug,
-                "date": m_date,
-                "completed": bool(status_completed),
-                "opp_id": opp_id,
-                "opp_name": opp_name,
-                "venue": venue,
-                "home_id": home_id,
-                "home_name": home_name,
-                "away_id": away_id,
-                "away_name": away_name,
-                "ft_home": ft_home,
-                "ft_away": ft_away,
-                "ht_home": ht_home,
-                "ht_away": ht_away,
-            }
-        )
-    return parsed
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_season_schedule(club_id: str, league_hint: str, season_id: int) -> list[dict]:
-    endpoints = [f"https://site.api.espn.com/apis/site/v2/sports/soccer/all/teams/{club_id}/schedule"]
-    if league_hint and league_hint != "all":
-        endpoints.append(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_hint}/teams/{club_id}/schedule")
-
-    merged = {}
-    for url in endpoints:
-        try:
-            resp = requests.get(url, params={"season": season_id}, headers=HEADERS, timeout=15)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            for m in parse_espn_events(data.get("events", []), club_id):
-                key = f"{m['date']}_{m['opp_id']}"
-                if key not in merged:
-                    merged[key] = m
+            md = datetime.fromisoformat(ev["date"].replace("Z", "+00:00")).astimezone(TR_TZ).date()
         except Exception:
             continue
-
-    matches = list(merged.values())
-    matches.sort(key=lambda x: x["date"])
-    return matches
-
-
-def find_neighbors(schedule: list[dict], target_date: date, opp_id: str):
-    idx = None
-    for i, m in enumerate(schedule):
-        if m["opp_id"] == str(opp_id) and m["date"] == target_date:
-            idx = i
-            break
-    if idx is None:
-        for i, m in enumerate(schedule):
-            if m["opp_id"] == str(opp_id) and abs((m["date"] - target_date).days) <= 5:
-                idx = i
-                break
-    if idx is None:
-        candidates = [(abs((m["date"] - target_date).days), i) for i, m in enumerate(schedule) if m["opp_id"] == str(opp_id)]
-        if candidates:
-            candidates.sort()
-            idx = candidates[0][1]
-    if idx is None:
-        for i, m in enumerate(schedule):
-            if m["date"] == target_date:
-                idx = i
-                break
-
-    if idx is None:
-        return None, None
-    return (schedule[idx - 1] if idx > 0 else None), (schedule[idx + 1] if idx < len(schedule) - 1 else None)
-
-
-def classify_iy_ms(m: dict) -> tuple[str, str, str]:
-    ft_h, ft_a = m.get("ft_home"), m.get("ft_away")
-    ht_h, ht_a = m.get("ht_home"), m.get("ht_away")
-
-    ms_str = f"{ft_h}-{ft_a}" if (ft_h is not None and ft_a is not None) else "-:-"
-    iy_str = f"{ht_h}-{ht_a}" if (ht_h is not None and ht_a is not None) else "-:-"
-
-    if ft_h is None or ft_a is None or ht_h is None or ht_a is None:
-        return iy_str, ms_str, "Bilinmiyor"
-
-    ht_res = "1" if ht_h > ht_a else ("2" if ht_h < ht_a else "X")
-    ft_res = "1" if ft_h > ft_a else ("2" if ft_h < ft_a else "X")
-    code = f"{ht_res}/{ft_res}"
-
-    if code == "1/2":
-        return iy_str, ms_str, "1/2 (İY 1 → MS 2)"
-    if code == "2/1":
-        return iy_str, ms_str, "2/1 (İY 2 → MS 1)"
-    return iy_str, ms_str, f"Normal ({code})"
-
-
-def format_opp(match_info: dict | None, show_details: bool) -> str:
-    if not match_info:
-        return "Yok (Sezon başı/sonu)"
-    if show_details:
-        d_str = match_info["date"].strftime("%d.%m.%Y")
-        venue = f" - {match_info['venue']}" if match_info["venue"] else ""
-        ft_h, ft_a = match_info.get("ft_home"), match_info.get("ft_away")
-        sc_txt = f" [{ft_h}-{ft_a}]" if (ft_h is not None and ft_a is not None) else ""
-        return f"{match_info['opp_name']} ({d_str}{venue}{sc_txt})"
-    return match_info["opp_name"]
-
-
-def evaluate_four_opponents(target_opps: dict[str, dict | None], cand_opps: dict[str, dict | None]) -> dict:
-    slots = ["a_prev", "a_next", "b_prev", "b_next"]
-    target_ids = {s: (target_opps[s]["opp_id"] if target_opps[s] else None) for s in slots}
-    cand_ids = {s: (cand_opps[s]["opp_id"] if cand_opps[s] else None) for s in slots}
-    cand_names = {s: (cand_opps[s]["opp_name"] if cand_opps[s] else "Yok") for s in slots}
-
-    target_valid_set = {v for v in target_ids.values() if v}
-    cand_valid_set = {v for v in cand_ids.values() if v}
-
-    exact_slot_matches = []
-    set_matched_slots = set()
-    matched_team_names = []
-
-    for s in slots:
-        cid = cand_ids[s]
-        if not cid:
+        comp = (ev.get("competitions") or [{}])[0]
+        cs = comp.get("competitors") or []
+        hs = next((c for c in cs if c.get("homeAway") == "home"), None)
+        as_ = next((c for c in cs if c.get("homeAway") == "away"), None)
+        ms = next((c for c in cs if str(c.get("team", {}).get("id")) == str(cid)), None)
+        os_ = next((c for c in cs if str(c.get("team", {}).get("id")) != str(cid)), None)
+        if not (hs and as_ and ms and os_):
             continue
-        if cid == target_ids[s]:
-            exact_slot_matches.append(s)
-            set_matched_slots.add(s)
-            matched_team_names.append(cand_names[s])
-        elif cid in target_valid_set:
-            set_matched_slots.add(s)
-            matched_team_names.append(cand_names[s])
+        ot, ht, at = os_["team"], hs["team"], as_["team"]
+        oid, onm = str(ot.get("id", "")), ot.get("displayName") or ot.get("shortDisplayName", "")
+        if not (oid and onm):
+            continue
+        done = bool(comp.get("status", {}).get("type", {}).get("completed"))
+        sc = lambda s: to_int(s["score"].get("value", s["score"].get("displayValue")) if isinstance(s.get("score"), dict) else s.get("score"))
+        hth, hta = ht_comp(cs) if done else (None, None)
+        out.append({"eid": str(ev.get("id", "")), "lg": (ev.get("league") or {}).get("slug", "") if isinstance(ev.get("league"), dict) else "", "date": md, "done": done, "oid": oid, "onm": onm, "ven": "Ev" if ms.get("homeAway") == "home" else "Dep", "hid": str(ht.get("id", "")), "hnm": ht.get("displayName") or ht.get("shortDisplayName", ""), "aid": str(at.get("id", "")), "anm": at.get("displayName") or at.get("shortDisplayName", ""), "fh": sc(hs) if done else None, "fa": sc(as_) if done else None, "hh": hth, "ha": hta})
+    return out
 
-    unique_matched_teams = list(dict.fromkeys(matched_team_names))
-    overlap_count = len(target_valid_set.intersection(cand_valid_set))
-    exact_slot_count = len(exact_slot_matches)
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_sched(cid: str, lg: str, yr: int):
+    merged = {}
+    for u in [f"{API}/all/teams/{cid}/schedule"] + ([f"{API}/{lg}/teams/{cid}/schedule"] if lg and lg != "all" else []):
+        try:
+            for m in parse_ev(requests.get(u, params={"season": yr}, headers=HDR, timeout=12).json().get("events", []), cid):
+                merged.setdefault(f"{m['date']}_{m['oid']}", m)
+        except Exception:
+            pass
+    return sorted(merged.values(), key=lambda x: x["date"])
 
-    if len(target_valid_set) == 4 and overlap_count == 4 and exact_slot_count == 4:
-        summary, level = "4/4 BİREBİR AYNI 4 TAKIM (Aynı Sıra)!", "exact"
-    elif len(target_valid_set) == 4 and overlap_count == 4:
-        summary, level = "4/4 AYNI 4 TAKIM (Farklı Sıra)!", "exact"
-    elif overlap_count > 0:
-        summary, level = f"{overlap_count}/4 Benzer ({', '.join(unique_matched_teams)})", "partial"
+def neighbors(sched, td, oid):
+    idx = next((i for i, m in enumerate(sched) if m["oid"] == str(oid) and m["date"] == td), None)
+    if idx is None:
+        idx = next((i for i, m in enumerate(sched) if m["oid"] == str(oid) and abs((m["date"] - td).days) <= 5), None)
+    if idx is None:
+        c = sorted((abs((m["date"] - td).days), i) for i, m in enumerate(sched) if m["oid"] == str(oid))
+        idx = c[0][1] if c else next((i for i, m in enumerate(sched) if m["date"] == td), None)
+    return (None, None) if idx is None else (sched[idx - 1] if idx > 0 else None, sched[idx + 1] if idx < len(sched) - 1 else None)
+
+def iy_ms(m):
+    fh, fa, hh, ha = m.get("fh"), m.get("fa"), m.get("hh"), m.get("ha")
+    ms = f"{fh}-{fa}" if fh is not None and fa is not None else "-:-"
+    iy = f"{hh}-{ha}" if hh is not None and ha is not None else "-:-"
+    if None in (fh, fa, hh, ha):
+        return iy, ms, "Bilinmiyor"
+    c = f"{'1' if hh > ha else ('2' if hh < ha else 'X')}/{'1' if fh > fa else ('2' if fh < fa else 'X')}"
+    return iy, ms, ("1/2 (İY 1 -> MS 2)" if c == "1/2" else ("2/1 (İY 2 -> MS 1)" if c == "2/1" else f"Normal ({c})"))
+
+def fmt(m, det):
+    if not m:
+        return "Yok (Sezon başı/sonu)"
+    if not det:
+        return m["onm"]
+    sc = f" [{m['fh']}-{m['fa']}]" if m.get("fh") is not None else ""
+    return f"{m['onm']} ({m['date'].strftime('%d.%m.%Y')} - {m['ven']}{sc})"
+
+def eval_sim(t_op, c_op):
+    slots = ["a_prev", "a_next", "b_prev", "b_next"]
+    ti = {s: (t_op[s]["oid"] if t_op[s] else None) for s in slots}
+    ci = {s: (c_op[s]["oid"] if c_op[s] else None) for s in slots}
+    ts, cs = {v for v in ti.values() if v}, {v for v in ci.values() if v}
+    nms = [c_op[s]["onm"] for s in slots if ci[s] and ci[s] in ts]
+    ep, ov = sum(1 for s in slots if ci[s] and ci[s] == ti[s]), len(ts & cs)
+    if len(ts) == 4 and ov == 4:
+        return f"4/4 AYNI 4 TAKIM ({'Aynı Sıra' if ep == 4 else 'Farklı Sıra'})!"
+    return f"{ov}/4 Benzer ({', '.join(dict.fromkeys(nms))})" if ov > 0 else "0/4 Farklı"
+
+st.title("⚽ 1/2 & 2/1 Geri Dönüş ve Rakip Analizi")
+st.caption("1/2 ve 2/1 maçlarını bulur, önceki/sonraki 4 rakibi karşılaştırır ve Excel çıktısı verir.")
+c1, c2 = st.columns(2)
+qa = c1.text_input("1. Takım Adı", "Galatasaray")
+qb = c2.text_input("2. Takım Adı", "Samsunspor")
+
+if st.button("Takımları Getir", type="secondary"):
+    with st.spinner("Takımlar aranıyor..."):
+        ca, ea = search_clubs(qa)
+        cb, eb = search_clubs(qb)
+        st.session_state.update({"ca": ca, "cb": cb, "ea": ea, "eb": eb})
+
+if "ca" in st.session_state and "cb" in st.session_state:
+    ca, cb = st.session_state["ca"], st.session_state["cb"]
+    if not ca or not cb:
+        if st.session_state.get("ea"):
+            st.error(f"1. Takım: {st.session_state['ea']}")
+        if st.session_state.get("eb"):
+            st.error(f"2. Takım: {st.session_state['eb']}")
     else:
-        summary, level = "0/4 Farklı", "none"
+        s1, s2 = st.columns(2)
+        sa = s1.selectbox("1. Takımı Onayla", ca, format_func=lambda x: f"{x['name']} ({x['league'].upper()})")
+        sb = s2.selectbox("2. Takımı Onayla", cb, format_func=lambda x: f"{x['name']} ({x['league'].upper()})")
+        s3, s4 = st.columns(2)
+        td = s3.date_input("Analiz Edilecek Maç Tarihi", date(2026, 11, 21), format="DD.MM.YYYY")
+        syrs = s4.slider("Taranacak Geçmiş Sezon", 5, 25, 15)
+        o1, o2 = st.columns(2)
+        only_cb = o1.checkbox("Sadece 1/2 ve 2/1 maçlarını çıkar", True)
+        det = o2.checkbox("Tarih, Ev/Dep ve skor ekle", True)
 
-    return {
-        "summary": summary,
-        "level": level,
-        "overlap_count": overlap_count,
-        "exact_slot_count": exact_slot_count,
-        "matched_slots": set_matched_slots,
-        "matched_teams": unique_matched_teams,
-    }def build_colored_excel(
-    }def build_colored_excel(
-    team_a_name: str,
-    team_b_name: str,
-    target_date_str: str,
-    rows_data: list[dict],
-    repeating_summary: list[tuple[str, int, list[str]]],
-    identical_pairs: list[str],
-) -> bytes:
-    wb = Workbook()
+        if st.button("Analizi Başlat", type="primary"):
+            with st.spinner("Fikstürler ve ilk yarı (İY) skorları taranıyor..."):
+                ty = season_of(td)
+                yrs = list(range(ty, ty - syrs, -1))
+                sam, sbm = {}, {}
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    for y, a_l, b_l in pool.map(lambda y: (y, fetch_sched(sa["id"], sa["league"], y), fetch_sched(sb["id"], sb["league"], y)), yrs):
+                        sam[y], sbm[y] = a_l, b_l
 
-    font_title = Font(name="Calibri", size=13, bold=True, color="FFFFFF")
-    font_subtitle = Font(name="Calibri", size=10, italic=True, color="1B365D")
-    font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    font_regular = Font(name="Calibri", size=10, bold=False, color="1F2937")
-    font_bold = Font(name="Calibri", size=10, bold=True, color="111827")
+                pa, na = neighbors(sam.get(ty, []), td, sb["id"])
+                pb, nb = neighbors(sbm.get(ty, []), td, sa["id"])
+                topps = {"a_prev": pa, "a_next": na, "b_prev": pb, "b_next": nb}
 
-    font_target = Font(name="Calibri", size=10, bold=True, color="1B365D")
-    font_1_2 = Font(name="Calibri", size=10, bold=True, color="9C2B00")
-    font_2_1 = Font(name="Calibri", size=10, bold=True, color="4C1D95")
-    font_green = Font(name="Calibri", size=10, bold=True, color="006100")
-    font_yellow = Font(name="Calibri", size=10, bold=True, color="7F6000")
+                tm = next((dict(m) for m in sam.get(ty, []) if m["oid"] == str(sb["id"]) and abs((m["date"] - td).days) <= 5), None)
+                if tm and tm["done"]:
+                    if tm["hh"] is None:
+                        tm["hh"], tm["ha"] = fetch_ht(tm["eid"], tm["lg"] or sa["league"], tm["hid"], tm["aid"])
+                    tiy, tms, tsc = iy_ms(tm)
+                else:
+                    tiy, tms, tsc = "-:-", "-:-", "Hedef Maç (Referans)"
 
-    fill_navy = PatternFill(start_color="1B365D", end_color="1B365D", fill_type="solid")
-    fill_subbanner = PatternFill(start_color="E8EEF5", end_color="E8EEF5", fill_type="solid")
-    fill_target = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    fill_zebra = PatternFill(start_color="F9FAFB", end_color="F9FAFB", fill_type="solid")
-    fill_white = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+                raw, sd = [], set()
+                for y in yrs:
+                    for m in reversed(sam.get(y, [])):
+                        if m["oid"] == str(sb["id"]) and m["date"] < td and m["done"] and m["date"].isoformat() not in sd:
+                            sd.add(m["date"].isoformat())
+                            raw.append((y, dict(m)))
 
-    fill_1_2 = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
-    fill_2_1 = PatternFill(start_color="EDE9FE", end_color="EDE9FE", fill_type="solid")
-    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    fill_green_strong = PatternFill(start_color="A9D08E", end_color="A9D08E", fill_type="solid")
-    fill_yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                def enr_fn(it):
+                    y, m = it
+                    if m["hh"] is None or m["ha"] is None:
+                        m["hh"], m["ha"] = fetch_ht(m["eid"], m["lg"] or sa["league"], m["hid"], m["aid"])
+                    return (y, m, *iy_ms(m))
 
-    thin_side = Side(border_style="thin", color="D1D5DB")
-    med_navy = Side(border_style="medium", color="1B365D")
-    border_cell = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-    border_target = Border(left=thin_side, right=thin_side, top=med_navy, bottom=med_navy)
+                enr = list(ThreadPoolExecutor(max_workers=8).map(enr_fn, raw)) if raw else []
+                flt = [x for x in enr if not only_cb or ("1/2" in x[4] or "2/1" in x[4])]
 
-    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+                excel_rows = [{
+                    "Tür": "Hedef Maç", "Tarih": td.strftime("%d.%m.%Y"),
+                    "Karşılaşma": f"{sa['name']} - {sb['name']}", "İY": tiy, "MS": tms, "Senaryo": tsc,
+                    f"{sa['name']} Önceki": fmt(pa, det), f"{sa['name']} Sonraki": fmt(na, det),
+                    f"{sb['name']} Önceki": fmt(pb, det), f"{sb['name']} Sonraki": fmt(nb, det),
+                    "4 Rakip Benzerliği": "Referans 4 Rakip",
+                }]
+                lines = [
+                    f"Hedef Maç: {td.strftime('%d.%m.%y')} {sa['name']} - {sb['name']} (İY: {tiy} | MS: {tms})",
+                    f"  • {sa['name']}: {fmt(pa, det)} | {fmt(na, det)}",
+                    f"  • {sb['name']}: {fmt(pb, det)} | {fmt(nb, det)}",
+                    f"\nBulunan Maçlar (Taranan: {len(raw)}, Listelenen: {len(flt)}):", "=" * 50,
+                ]
+                cnt, rmap, sets = Counter(), {}, []
+                tset = frozenset(v["oid"] for v in topps.values() if v)
+                if len(tset) == 4:
+                    sets.append((f"Hedef ({td.strftime('%d.%m.%Y')})", tset, topps))
 
-    ws1 = wb.active
-    ws1.title = "1-2_2-1_Analizi"
-    ws1.views.sheetView[0].showGridLines = True
+                for hs, h, iys, mss, scs in flt:
+                    hd = h["date"]
+                    hds, mt = hd.strftime("%d.%m.%Y"), f"{h['hnm']} - {h['anm']}"
+                    p_a, n_a = neighbors(sam.get(hs, []), hd, sb["id"])
+                    p_b, n_b = neighbors(sbm.get(hs, []), hd, sa["id"])
+                    copps = {"a_prev": p_a, "a_next": n_a, "b_prev": p_b, "b_next": n_b}
+                    sim_txt = eval_sim(topps, copps)
+                    for mo, rl in [(p_a, f"{hds} ({sa['name']} Önceki)"), (n_a, f"{hds} ({sa['name']} Sonraki)"), (p_b, f"{hds} ({sb['name']} Önceki)"), (n_b, f"{hds} ({sb['name']} Sonraki)")]:
+                        if mo:
+                            cnt[mo["onm"]] += 1
+                            rmap.setdefault(mo["onm"], []).append(rl)
+                    cs = frozenset(v["oid"] for v in copps.values() if v)
+                    if len(cs) == 4:
+                        sets.append((f"{hds} {mt} [{scs}]", cs, copps))
+                    excel_rows.append({
+                        "Tür": "Geri Dönüş (1/2)" if "1/2" in scs else ("Geri Dönüş (2/1)" if "2/1" in scs else "Geçmiş Maç"),
+                        "Tarih": hds, "Karşılaşma": mt, "İY": iys, "MS": mss, "Senaryo": scs,
+                        f"{sa['name']} Önceki": fmt(p_a, det), f"{sa['name']} Sonraki": fmt(n_a, det),
+                        f"{sb['name']} Önceki": fmt(p_b, det), f"{sb['name']} Sonraki": fmt(n_b, det),
+                        "4 Rakip Benzerliği": sim_txt,
+                    })
+                    lines += [
+                        f"\n• {hds} | {mt} | İY: {iys} / MS: {mss} -> [{scs}]",
+                        f"  {sa['name']}: {fmt(p_a, det)} | {fmt(n_a, det)}",
+                        f"  {sb['name']}: {fmt(p_b, det)} | {fmt(n_b, det)}",
+                        f"  4 Rakip Benzerliği: {sim_txt}",
+                    ]
 
-    headers_1 = [
-        "Kayıt Türü",
-        "Tarih",
-        "Karşılaşma",
-        "İlk Yarı (İY)",
-        "Maç Sonu (MS)",
-        "Senaryo",
-        f"{team_a_name} Önceki Rakip",
-        f"{team_a_name} Sonraki Rakip",
-        f"{team_b_name} Önceki Rakip",
-        f"{team_b_name} Sonraki Rakip",
-        "4 Rakip Benzerlik Analizi",
-    ]
-    total_cols = len(headers_1)
+                id_pairs = [
+                    f"AYNI 4 TAKIM: {sets[i][0]} <==> {sets[j][0]} ({', '.join(v['onm'] for v in sets[i][2].values() if v)})"
+                    for i in range(len(sets)) for j in range(i + 1, len(sets)) if sets[i][1] == sets[j][1]
+                ]
+                rep = [(k, v, rmap[k]) for k, v in cnt.most_common() if v >= 2]
 
-    ws1.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
-    c_title = ws1.cell(
-        row=1,
-        column=1,
-        value=f"⚽ {team_a_name} - {team_b_name} | 1/2 & 2/1 Geri Dönüş ve 4 Çevre Rakip Analizi (Hedef: {target_date_str})",
-    )
-    c_title.font = font_title
-    c_title.fill = fill_navy
-    c_title.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-    ws1.row_dimensions[1].height = 30
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Taranan Maç", len(raw))
+                m2.metric("Bulunan 1/2 - 2/1", len(flt))
+                m3.metric("4/4 Aynı Set", len(id_pairs))
+                for ip in id_pairs:
+                    st.success(f"🎯 {ip}")
+                if rep:
+                    with st.expander("🔁 Tekrar Eden Çevre Rakipler", expanded=True):
+                        for tn, cv, rls in rep:
+                            st.write(f"**{tn}** ({cv} kez): {' • '.join(rls)}")
 
-    ws1.merge_cells(start_row=2, start_column=1, end_row=2, end_column=total_cols)
-    c_leg = ws1.cell(
-        row=2,
-        column=1,
-        value="Renk Rehberi:  [Mavi Satır: Hedef Referans Maç]   [Turuncu: 1/2 (İY 1 → MS 2)]   [Mor: 2/1 (İY 2 → MS 1)]   [Yeşil Hücre: Hedef Maçtaki ile Aynı Rakip]",
-    )
-    c_leg.font = font_subtitle
-    c_leg.fill = fill_subbanner
-    c_leg.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-    ws1.row_dimensions[2].height = 22
+                df_main = pd.DataFrame(excel_rows)
+                st.subheader("Özet Tablo")
+                st.dataframe(df_main, use_container_width=True, hide_index=True)
+                st.subheader("Metin Çıktısı (Sağ üstten tek tıkla kopyala)")
+                st.code("\n".join(lines), language=None)
 
-    header_row = 4
-    ws1.row_dimensions[header_row].height = 28
-    for col_idx, h_text in enumerate(headers_1, start=1):
-        cell = ws1.cell(row=header_row, column=col_idx, value=h_text)
-        cell.font = font_header
-        cell.fill = fill_navy
-        cell.alignment = align_center
-        cell.border = border_cell
-
-    slot_col_map = {"a_prev": 7, "a_next": 8, "b_prev": 9, "b_next": 10}
-
-    for idx, r in enumerate(rows_data):
-        row_num = header_row + 1 + idx
-        is_target = r["is_target"]
-        scenario = r["scenario"]
-        sim = r["similarity"]
-
-        vals = [
-            r["kind"],
-            r["date"],
-            r["match"],
-            r["iy"],
-            r["ms"],
-            scenario,
-            r["a_prev_txt"],
-            r["a_next_txt"],
-            r["b_prev_txt"],
-            r["b_next_txt"],
-            sim["summary"] if not is_target else "Referans 4 Rakip Seti",
-        ]
-
-        base_fill = fill_target if is_target else (fill_zebra if idx % 2 == 1 else fill_white)
-        base_font = font_target if is_target else font_regular
-        row_border = border_target if is_target else border_cell
-
-        max_lines = 1
-        for col_idx, val in enumerate(vals, start=1):
-            cell = ws1.cell(row=row_num, column=col_idx, value=val)
-            cell.fill = base_fill
-            cell.font = base_font
-            cell.border = row_border
-            cell.alignment = align_center if col_idx in (1, 2, 4, 5, 6) else align_left
-            if isinstance(val, str) and len(val) > 28:
-                max_lines = max(max_lines, 2)
-
-        if "1/2" in scenario:
-            ws1.cell(row=row_num, column=1).fill = fill_1_2
-            ws1.cell(row=row_num, column=1).font = font_1_2
-            ws1.cell(row=row_num, column=6).fill = fill_1_2
-            ws1.cell(row=row_num, column=6).font = font_1_2
-        elif "2/1" in scenario:
-            ws1.cell(row=row_num, column=1).fill = fill_2_1
-            ws1.cell(row=row_num, column=1).font = font_2_1
-            ws1.cell(row=row_num, column=6).fill = fill_2_1
-            ws1.cell(row=row_num, column=6).font = font_2_1
-
-        if not is_target:
-            for slot_key in sim["matched_slots"]:
-                c_i = slot_col_map[slot_key]
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    df_main.to_excel(writer, index=False, sheet_name="1-2_2-1_Analizi")
+                    rep_rows = [{"Rakip Takım": tn, "Tekrar": f"{cv} kez", "Maç ve Pozisyonlar": " | ".join(rls)} for tn, cv, rls in rep] or [{"Rakip Takım": "Tekrar eden rakip yok", "Tekrar": "-", "Maç ve Pozisyonlar": "-"}]
+                    pd.DataFrame(rep_rows).to_excel(writer, index=False, sheet_name="Tekrar_Eden_Rakipler")
+                st.download_button(
+                    "📥 Excel Olarak İndir (.xlsx)",
+                    data=buf.getvalue(),
+                    file_name=f"{sa['name']}_{sb['name']}_1-2_2-1_analiz.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
