@@ -399,6 +399,7 @@ def evaluate_four_opponents(target_opps: dict[str, dict | None], cand_opps: dict
         "matched_slots": set_matched_slots,
         "matched_teams": unique_matched_teams,
     }def build_colored_excel(
+    }def build_colored_excel(
     team_a_name: str,
     team_b_name: str,
     target_date_str: str,
